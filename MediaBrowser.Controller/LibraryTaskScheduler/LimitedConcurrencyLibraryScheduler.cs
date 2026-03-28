@@ -243,9 +243,9 @@ public sealed class LimitedConcurrencyLibraryScheduler : ILimitedConcurrencyLibr
             };
         }).ToArray();
 
-        if (ShouldForceSequentialOperation() || _deadlockDetector.Value is not null)
+        if (ShouldForceSequentialOperation())
         {
-            _logger.LogDebug("Process sequentially.");
+            _logger.LogDebug("Process sequentially (forced). items={Count}", workItems.Length);
             try
             {
                 foreach (var item in workItems)
@@ -262,17 +262,84 @@ public sealed class LimitedConcurrencyLibraryScheduler : ILimitedConcurrencyLibr
             return;
         }
 
-        for (var i = 0; i < workItems.Length; i++)
+        if (_deadlockDetector.Value is not null)
         {
-            var item = workItems[i]!;
-            await _tasks.Writer.WriteAsync(item, CancellationToken.None).ConfigureAwait(false);
-        }
+            // Nested invocation from within a runner — process sequentially inline.
+            // Do NOT write to the channel: that risks cross-runner item stealing and
+            // circular waits between in-place loops.
+            _logger.LogDebug("Process sequentially (nested). items={Count}", workItems.Length);
+            try
+            {
+                for (var idx = 0; idx < workItems.Length; idx++)
+                {
+                    var item = workItems[idx];
+                    await ProcessItem(item).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                // operation is cancelled. Do nothing.
+            }
 
-        Worker();
-        _logger.LogDebug("Wait for {NoWorkers} to complete.", workItems.Length);
-        await Task.WhenAll([.. workItems.Select(f => f.Done.Task)]).ConfigureAwait(false);
-        _logger.LogDebug("{NoWorkers} completed.", workItems.Length);
-        ScheduleTaskCleanup();
+            _logger.LogDebug("Process sequentially done.");
+        }
+        else
+        {
+            // Top-level parallel path.
+            _logger.LogDebug("Process parallel. items={Count}", workItems.Length);
+            for (var i = 0; i < workItems.Length; i++)
+            {
+                await _tasks.Writer.WriteAsync(workItems[i], CancellationToken.None).ConfigureAwait(false);
+            }
+
+            Worker();
+
+            // When items outnumber runners, a bare Task.WhenAll deadlocks because
+            // excess items sit in the channel with no free runner to pick them up.
+            // Instead, actively drain the channel while waiting. Set the deadlock
+            // detector so any nested Enqueue from items we process goes sequential.
+            var drainSentinel = new CancellationTokenSource();
+            _deadlockDetector.Value = drainSentinel;
+            _logger.LogDebug("Wait for {NoWorkers} to complete.", workItems.Length);
+            try
+            {
+                while (workItems.Any(e => !e.Done.Task.IsCompleted))
+                {
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        break;
+                    }
+
+                    if (_tasks.Reader.TryRead(out var channelItem))
+                    {
+                        _logger.LogDebug("Drain processing '{Data}'.", channelItem.Data);
+                        await ProcessItem(channelItem).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        // Channel empty — all items are with runners or already done.
+                        // Wait for any to complete rather than spinning.
+                        var pending = workItems
+                            .Where(e => !e.Done.Task.IsCompleted)
+                            .Select(e => e.Done.Task)
+                            .ToArray();
+                        if (pending.Length > 0)
+                        {
+                            await Task.WhenAny(pending).ConfigureAwait(false);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                // Restore — the calling thread is not a runner.
+                _deadlockDetector.Value = null!;
+                drainSentinel.Dispose();
+            }
+
+            _logger.LogDebug("{NoWorkers} completed.", workItems.Length);
+            ScheduleTaskCleanup();
+        }
     }
 
     /// <inheritdoc/>
