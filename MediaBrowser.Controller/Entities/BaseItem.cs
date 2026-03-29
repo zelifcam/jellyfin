@@ -687,19 +687,7 @@ namespace MediaBrowser.Controller.Entities
         {
             get
             {
-                var officialRating = OfficialRating;
-                if (!string.IsNullOrEmpty(officialRating))
-                {
-                    return officialRating;
-                }
-
-                var parent = DisplayParent;
-                if (parent is not null)
-                {
-                    return parent.OfficialRatingForComparison;
-                }
-
-                return null;
+                return GetOfficialRatingForComparison();
             }
         }
 
@@ -801,6 +789,26 @@ namespace MediaBrowser.Controller.Entities
             if (parent is not null && !callstack.Contains(parent.Id))
             {
                 return parent.GetCustomRatingForComparision(callstack);
+            }
+
+            return null;
+        }
+
+        private string GetOfficialRatingForComparison(HashSet<Guid> callstack = null)
+        {
+            callstack ??= new();
+            var officialRating = OfficialRating;
+            if (!string.IsNullOrEmpty(officialRating))
+            {
+                return officialRating;
+            }
+
+            callstack.Add(Id);
+
+            var parent = DisplayParent;
+            if (parent is not null && !callstack.Contains(parent.Id))
+            {
+                return parent.GetOfficialRatingForComparison(callstack);
             }
 
             return null;
@@ -1017,10 +1025,16 @@ namespace MediaBrowser.Controller.Entities
 
         public IEnumerable<BaseItem> GetParents()
         {
+            var visited = new HashSet<Guid>();
             var parent = GetParent();
 
             while (parent is not null)
             {
+                if (!visited.Add(parent.Id))
+                {
+                    break;
+                }
+
                 yield return parent;
 
                 parent = parent.GetParent();
@@ -1591,6 +1605,13 @@ namespace MediaBrowser.Controller.Entities
 
             var maxAllowedRating = user.MaxParentalRatingScore;
             var maxAllowedSubRating = user.MaxParentalRatingSubScore;
+
+            // User has no parental restriction and does not block unrated content
+            if (!maxAllowedRating.HasValue && !GetBlockUnratedValue(user))
+            {
+                return true;
+            }
+
             var rating = CustomRatingForComparison;
 
             if (string.IsNullOrEmpty(rating))

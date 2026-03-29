@@ -2261,8 +2261,14 @@ namespace Emby.Server.Implementations.Library
 
         public List<Folder> GetCollectionFolders(BaseItem item, IEnumerable<Folder> allUserRootChildren)
         {
+            var visited = new HashSet<Guid>();
             while (item is not null)
             {
+                if (!visited.Add(item.Id))
+                {
+                    break;
+                }
+
                 var parent = item.GetParent();
 
                 if (parent is AggregateFolder)
